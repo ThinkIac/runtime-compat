@@ -1,0 +1,147 @@
+# Compatibility ports for existing capability factories. No global container.
+requireCapabilityDependency = (name) -> require name
+{ createScanners } = requireCapabilityDependency '@thinkiac/module-annotations'
+{ resolveConditions } = requireCapabilityDependency '@thinkiac/module-annotations/conditions.cjs'
+
+createHost = (container, kernel, subscriptions) ->
+  { currentAuthority, runAsPackage, runAsSystem } = kernel.authority
+  { createRuntimeContext } = kernel.context
+  { appendLog, getErrors } = kernel.debug
+  { getIsolatedRunner } = kernel.isolation
+  path = require 'node:path'
+  scopedScan = (folder, args...) ->
+    absolute = if path.isAbsolute(folder) then folder else path.join container.workspace, folder
+    if path.resolve(absolute) is path.resolve(container.workspace)
+      groups = await Promise.all container.registry.discover().map (pkg) -> kernel.scan.registerGeneric pkg.dir, args...
+      return groups.flat()
+    await kernel.scan.registerGeneric absolute, args...
+  scans = { createScanners(scopedScan)..., resolveAgentFolder: kernel.scan.resolveAgentFolder }
+  { registerRoutes, registerHooks, registerTools, registerCommands } = scans
+  { loadMiddlewareSnapshot, resolveMiddlewares, runMiddlewares } = requireCapabilityDependency('@thinkiac/module-annotations/middleware.cjs').create scans
+  { generateManifest } = requireCapabilityDependency('@thinkiac/module-annotations/manifest.cjs').create scans
+  routeMountPath = (pkg, route) -> if route.startsWith('/') then route else '/' + pkg + '/' + route
+  stabilizationPorts = -> kernel.lifecycle
+  requestReboot = (c, options) -> kernel.ports['stabilizer/isolation'].requestReboot c, options
+  externalApi = (c, name) ->
+    api = c.state('external-api').get name
+    throw new Error '[logos] external capability unavailable: ' + name unless api
+    api
+  subscribe = (once, event, handler, options) ->
+    unsubscribe = if once then container.bus.once(event, handler, options) else container.bus.on(event, handler, options)
+    subscriptions.add unsubscribe
+    ->
+      subscriptions.delete unsubscribe
+      unsubscribe()
+  http =
+    app: -> container.app
+    setApp: (app) ->
+      container.app = app
+      return
+    setServer: (server) ->
+      container.server = server
+      return
+    server: -> externalApi(container, 'http').createServer()
+    getErrors: getErrors
+    packageSnapshot: -> container.registry.snapshot()
+    getPackageMount: -> externalApi(container, 'http').getPackageMount()
+    scanRoutes: registerRoutes
+    isolatedRunner: (pkg) -> getIsolatedRunner container, pkg
+    createContext: createRuntimeContext
+    loadMiddlewareSnapshot: loadMiddlewareSnapshot
+    resolveMiddlewares: resolveMiddlewares
+    runMiddlewares: runMiddlewares
+    routeMountPath: routeMountPath
+    recordOfflineRoutes: (pkg, routes) -> container.bus.emit 'views:offline_routes', { pkg, routes }
+    runAsPackage: (pkg, work) -> runAsPackage container.authority, pkg, work
+  # Express remains lazy: importing this bridge does not load the HTTP stack.
+  Object.defineProperty http, 'express', { enumerable: true, configurable: true, get: -> require 'express' }
+  Object.freeze
+    kernelPrimitives: stabilizationPorts
+    authority: Object.freeze { runAsSystem, runAsPackage }
+    applicationRoot: -> process.cwd()
+    workspace: -> container.workspace
+    dataDir: -> process.env.LOGOS_DATA_DIR
+    appendLog: appendLog
+    currentAuthority: currentAuthority
+    log: (message) -> container.log message
+    createContext: createRuntimeContext
+    resolveConditions: resolveConditions
+    scanHooks: registerHooks
+    loadTools: (workspace) -> externalApi(container, 'tools').loadMcpTools workspace
+    on: (event, handler, options) -> subscribe false, event, handler, options
+    once: (event, handler, options) -> subscribe true, event, handler, options
+    emit: (event, payload, context) -> container.bus.emit event, payload, context
+    pipeline: (event, payload, context) -> container.bus.pipeline event, payload, context
+    veto: (event, payload, context) -> container.bus.veto event, payload, context
+    state: (namespace) -> container.state namespace
+    registry: Object.freeze
+      getPackage: (name) -> container.registry.getPackage name
+      discover: -> container.registry.discover()
+    config: -> container.config
+    http: Object.freeze http
+    ws: Object.freeze { getHub: -> externalApi(container, 'ws').getHub() }
+    tools: Object.freeze
+      authority: -> container.authority
+      scan: registerTools
+      resolveMiddlewares: resolveMiddlewares
+      runMiddlewares: runMiddlewares
+      generateManifest: generateManifest
+      getErrors: getErrors
+      requestReboot: (ignored, options) -> requestReboot container, options
+      currentAuthority: currentAuthority
+      runAsPackage: (_authority, pkg, work) -> runAsPackage container.authority, pkg, work
+      runAsSystem: (_authority, work) -> runAsSystem container.authority, work
+      isolatedRunner: (_ignored, pkg) -> getIsolatedRunner container, pkg
+    commands: Object.freeze
+      scan: registerCommands
+      resolveConditions: resolveConditions
+      createContext: createRuntimeContext
+      resolveMiddlewares: resolveMiddlewares
+      runMiddlewares: runMiddlewares
+    storage: Object.freeze
+      config: -> container.config.storage or {}
+      workspace: -> container.workspace
+    process: Object.freeze
+      getScope: (pkg) -> container.getPackageScope pkg
+      createScope: (pkg, version) -> container.createPackageScope pkg, version
+      disposeScope: (pkg, reason) -> container.disposePackageScope pkg, reason
+      supervisor: -> container.state('supervisor').get 'controller'
+      recoverIsolatedPackage: (folder) -> kernel.ports['stabilizer/isolation'].recoverIsolatedPackage container, folder
+    # Legacy repo alone still receives a container handle; retained intentionally.
+    repo: Object.freeze
+      container: -> container
+      isBranchInstance: -> process.env.LOGOS_ROLE is 'branch'
+    scopes: Object.freeze
+      get: (pkg) -> container.getPackageScope pkg
+      create: (pkg, version) -> container.createPackageScope pkg, version
+      dispose: (pkg, reason) -> container.disposePackageScope pkg, reason
+      removeOwner: (pkg) -> container.bus.removeOwner pkg
+
+validateToolSchema = (tool) ->
+  schema = tool?.parameters
+  unless schema and schema.type is 'object' and schema.properties and typeof schema.properties is 'object'
+    throw new TypeError "Tool #{tool?.name ? '<unknown>'} must expose an object JSON schema"
+  if schema.required isnt undefined and not Array.isArray schema.required
+    throw new TypeError "Tool #{tool?.name ? '<unknown>'} schema.required must be an array"
+  return
+
+validatePackageWiring = (container, kernel, pkg) ->
+  { normalizePackageContract } = kernel.lifecycle['../kernel/package-contract']
+  { getIsolatedRunner } = kernel.isolation
+  { registerTools, registerHooks } = createScanners kernel.scan.registerGeneric
+  contract = normalizePackageContract pkg
+  principal = { kind: 'package', id: pkg.folder }
+  runner = getIsolatedRunner container, pkg.folder
+  surfaces = runner?.surfaces
+  if pkg.isolated is true and not surfaces
+    throw new Error "Isolated package #{pkg.folder} has no running runner"
+  tools = if surfaces then surfaces.tools.map((tool) -> { tool..., call: (args, context) -> runner.invoke tool.id, [args], context }) else await registerTools pkg.folder
+  hooks = if surfaces then surfaces.hooks.map((hook) -> { hook..., call: (payload, context) -> runner.invoke hook.id, [payload], context }) else await registerHooks pkg.folder
+  for tool in tools
+    validateToolSchema tool
+    container.authority.enforce { principal, surface: 'tools', operation: 'provide', resource: "#{pkg.folder}.#{tool.name}" }
+  for hook in hooks
+    container.authority.enforce { principal, surface: 'events', operation: 'transform', resource: hook.event }
+  { contract, tools: tools.length, hooks: hooks.length }
+
+module.exports = { createHost, validatePackageWiring }

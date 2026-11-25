@@ -1,0 +1,34 @@
+path = require 'node:path'
+{ createRequire } = require 'node:module'
+mapping = require '../legacy-modules.json'
+libraries = new WeakMap()
+
+# Cache is scoped to the kernel scanner, preserving cycles and retry on failure.
+createLegacyLibrary = (kernel, resolveModule) ->
+  return libraries.get kernel.scan if libraries.has kernel.scan
+  cache = new Map()
+  load = (name) ->
+    return cache.get(name).exports if cache.has name
+    target = mapping[name]
+    throw new Error "Unknown legacy capability import: #{name}" unless target
+    filename = path.join resolveModule(target[0]), 'compat', target[1]
+    entry = { exports: {} }
+    cache.set name, entry
+    ownerRequire = createRequire filename
+    requireScoped = (id) ->
+      return ownerRequire id unless id.startsWith '.'
+      dependency = path.posix.normalize path.posix.join path.posix.dirname(name), id
+      return load dependency if mapping[dependency]
+      return kernel.ports[dependency] if kernel.ports[dependency]
+      return require id if path.isAbsolute id
+      throw new Error "Undeclared legacy capability dependency: #{name} -> #{id}"
+    try
+      require(filename) requireScoped, entry, entry.exports, path.dirname(filename), filename,
+        { resolveModule: (name) -> require resolveModule name }
+    catch error
+      cache.delete name
+      throw error
+    entry.exports
+  libraries.set kernel.scan, load
+  load
+module.exports = { createLegacyLibrary }
